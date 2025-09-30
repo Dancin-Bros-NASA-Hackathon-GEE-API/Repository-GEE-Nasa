@@ -1,1 +1,0 @@
-Scrpts GEE and QGIS
