@@ -1,0 +1,378 @@
+/****  TERRA – GUERRERO: De selva a potrero (2001–2024)  ****/
+/* Autoría: tu equipo – Hackatón NASA Space Apps Guerrero
+   - MCD12Q1 v061 (IGBP) suele llegar hasta 2023/2024. Ajusta endYear si falta.
+   - “Potrero” ~ Croplands + Grasslands (IGBP 12 y 10).
+   - Produce:
+       (1) Timelapse clasificado (otros / bosque / ag+pasto)
+       (2) Pérdida acumulada bosque→ag/pasto
+       (3) Ranking municipal con NDVI
+       (4) “Lupas” ASTER para antes/después (cliente)
+*/
+
+/* ==============================
+   0) Parámetros
+============================== */
+var startYear   = 2001;
+var endYear     = 2024;       // bájalo a 2023 si 2024 no está disponible aún
+var fps         = 2;          // cuadros por segundo para el video
+var exportScale = 250;        // m; 250–500 m recomendado
+var topNHotspots = 4;         // cuántos municipios destacar
+
+/* ==============================
+   1) AOI: Estado de Guerrero + Municipios
+============================== */
+var guerrero = ee.FeatureCollection('FAO/GAUL/2015/level1')
+  .filter(ee.Filter.eq('ADM0_NAME', 'Mexico'))
+  .filter(ee.Filter.eq('ADM1_NAME', 'Guerrero'))
+  .geometry();
+
+Map.centerObject(guerrero, 7);
+Map.addLayer(guerrero, {color: 'white'}, 'AOI Guerrero', false);
+
+var municipios = ee.FeatureCollection('FAO/GAUL/2015/level2')
+  .filter(ee.Filter.eq('ADM0_NAME', 'Mexico'))
+  .filter(ee.Filter.eq('ADM1_NAME', 'Guerrero'));
+
+/* ==============================
+   2) Colecciones MODIS (Terra)
+============================== */
+// Land cover anual (MCD12Q1 v061 – IGBP LC_Type1)
+var lcCol = ee.ImageCollection('MODIS/061/MCD12Q1')
+  .filterBounds(guerrero)
+  .filter(ee.Filter.calendarRange(startYear, endYear, 'year'))
+  .select('LC_Type1');
+
+// NDVI (MOD13Q1, 16 días, 250 m) – escalar por 0.0001
+var ndviCol = ee.ImageCollection('MODIS/061/MOD13Q1')
+  .filterBounds(guerrero)
+  .map(function(img){
+    return img.select('NDVI').multiply(0.0001)
+      .copyProperties(img, ['system:time_start']);
+  });
+
+/* ==============================
+   3) Helpers
+============================== */
+function anyEq(image, values) {
+  var out = ee.Image(0);
+  values.forEach(function(v){ out = out.or(image.eq(v)); });
+  return out;
+}
+
+var years = ee.List.sequence(startYear, endYear);
+
+// Asegura una imagen por año
+var lcByYear = ee.ImageCollection(years.map(function(y){
+  y = ee.Number(y);
+  var img = lcCol.filter(ee.Filter.calendarRange(y, y, 'year')).first();
+  return ee.Image(img).select('LC_Type1').rename('lc')
+           .set('year', y)
+           .set('system:time_start', ee.Date.fromYMD(y,1,1).millis());
+}));
+
+// Conjuntos de clases
+var forestClasses = [1,2,3,4,5];  // bosques
+var agClasses     = [12];         // croplands
+var grassClasses  = [10];         // grasslands
+var agGrassAll    = agClasses.concat(grassClasses);
+
+// Re-clasificación a 3 categorías: 0=otros, 1=bosque, 2=ag/pasto
+var recodedCol = lcByYear.map(function(img){
+  var lc = img.select('lc');
+  var forest = anyEq(lc, forestClasses);
+  var agPast = anyEq(lc, agGrassAll);
+  var rec = ee.Image(0).where(forest, 1).where(agPast, 2).rename('class');
+  return rec.set('year', img.get('year'))
+            .set('system:time_start', img.get('system:time_start'));
+});
+
+// Estilo para previsualización del timelapse
+var visClass = {min: 0, max: 2, palette: ['9e9e9e','1a9850','d7301f']}; // gris/verde/rojo
+var styledCol = recodedCol.map(function(img){
+  return img.visualize(visClass)
+            .set('system:time_start', img.get('system:time_start'));
+});
+
+Map.addLayer(recodedCol.filter(ee.Filter.eq('year', startYear)).first(), visClass, 'Clasif inicio', false);
+Map.addLayer(recodedCol.filter(ee.Filter.eq('year', endYear)).first(),   visClass, 'Clasif final',  false);
+
+/* ==============================
+   4) Cambio bosque→ag/pasto (año-a-año)
+============================== */
+var recList = recodedCol.toList(recodedCol.size());
+var pairwiseLoss = ee.ImageCollection(ee.List.sequence(0, recodedCol.size().subtract(2)).map(function(i){
+  i = ee.Number(i);
+  var y1 = ee.Image(recList.get(i));
+  var y2 = ee.Image(recList.get(i.add(1)));
+  var loss = y1.eq(1).and(y2.eq(2)).rename('loss'); // 1=forest, 2=ag/pasto
+  return loss.set({
+    'year1': y1.get('year'),
+    'year2': y2.get('year'),
+    'system:time_start': y2.get('system:time_start')
+  });
+}));
+
+// Pérdida acumulada en todo el periodo
+var anyLoss = pairwiseLoss.max().selfMask();
+Map.addLayer(anyLoss.updateMask(anyLoss), {palette:['ffcc00']}, 'Pérdida acumulada bosque→ag/pasto', true);
+
+/* ==============================
+   5) Ranking municipal (hotspots) — FIX features
+============================== */
+var ha = ee.Image.pixelArea().divide(10000); // ha/pixel
+
+// Área perdida (ha) por municipio
+var lossAreaByMun = ha.updateMask(anyLoss).reduceRegions({
+  collection: municipios,
+  reducer: ee.Reducer.sum(),
+  scale: 500
+}).map(function (f) {
+  var s = ee.Number(f.get('sum'));
+  var haLoss = ee.Number(ee.Algorithms.If(s, s, 0));
+  return f.set('ha_loss', haLoss);
+});
+
+// NDVI: base (2001–2005) vs reciente (2020–2024)
+var baseNDVI   = ndviCol.filterDate('2001-01-01', '2006-01-01').mean();
+var recentNDVI = ndviCol.filterDate('2020-01-01', '2025-01-01').mean();
+var ndviDiff   = recentNDVI.subtract(baseNDVI).rename('ndvi_diff');
+
+// Media de NDVI por municipio
+var ndviByMun = ndviDiff.reduceRegions({
+  collection: municipios,
+  reducer: ee.Reducer.mean(),
+  scale: 250
+}).map(function (f) {
+  var m = ee.Number(f.get('mean'));
+  var nd = ee.Number(ee.Algorithms.If(m, m, 0));
+  return f.set('ndvi_diff', nd);
+});
+
+// Inner join por nombre de municipio
+var join   = ee.Join.inner();
+var filter = ee.Filter.equals({ leftField: 'ADM2_NAME', rightField: 'ADM2_NAME' });
+var joined = join.apply(lossAreaByMun, ndviByMun, filter);
+
+// Score: ha_loss * (-ndvi_diff)
+var hotspots = ee.FeatureCollection(joined.map(function (pair) {
+  var left  = ee.Feature(pair.get('primary'));   // ha_loss
+  var right = ee.Feature(pair.get('secondary')); // ndvi_diff
+  var haLoss = ee.Number(left.get('ha_loss'));
+  var ndviD  = ee.Number(right.get('ndvi_diff'));
+  var score = haLoss.multiply(ndviD.multiply(-1));
+  return left.copyProperties(right, ['ndvi_diff'])
+             .set({ 'score': score, 'ha_loss': haLoss });
+}));
+
+var top = hotspots.sort('score', false).limit(topNHotspots);
+
+// Tabla en cliente (opcional, más rápida de leer)
+top.evaluate(function(fc){
+  var rows = fc.features.map(function(f){
+    var p = f.properties;
+    return {
+      Municipio: p.ADM2_NAME,
+      'ha_loss': p.ha_loss,
+      'ndvi_diff': p.ndvi_diff,
+      'score': p.score
+    };
+  });
+  print('TOP hotspots (tabla):', rows);
+});
+
+// --- SCORE HOTSPOT (evitar "Can’t encode object") ---
+var scoreImg = hotspots
+  .reduceToImage(['score'], ee.Reducer.first())
+  .clip(guerrero);
+
+// Dibujar con 'max' obtenido del lado cliente
+hotspots.aggregate_max('score').evaluate(function (maxScore) {
+  maxScore = (maxScore && maxScore > 0) ? maxScore : 1;
+  Map.addLayer(
+    scoreImg,
+    {min: 0, max: maxScore, palette: ['fff7ec','fdbb84','e34a33']},
+    'Score hotspot',
+    false
+  );
+});
+
+/**** === VIDEO MP4 CON OVERLAY DE MUNICIPIOS + HOTSPOTS === ****/
+
+// 1) Overlays estáticos
+var limitesMunImg = ee.Image().byte().paint(municipios, 1, 1)
+  .visualize({palette: ['ffffff'], opacity: 0.8});   // contorno blanco
+
+var topOutlineImg = ee.Image().byte().paint(top, 1, 3)
+  .visualize({palette: ['ff0000'], opacity: 1});     // contorno rojo (hotspots)
+
+var overlayImg = ee.ImageCollection([limitesMunImg, topOutlineImg]).mosaic();
+
+// 2) Mezcla overlay con cada frame de la clasificación
+var framesConOverlay = recodedCol.map(function(img){
+  var year = ee.Number(img.get('year'));
+  var base = img.visualize({min:0, max:2, palette:['9e9e9e','1a9850','d7301f']});
+  var blended = base.blend(overlayImg);
+  // asegura el time_start para el orden del video
+  return blended.set('system:time_start', ee.Date.fromYMD(year,1,1).millis());
+});
+
+// 3) Exporta a MP4 en Google Drive
+Export.video.toDrive({
+  collection: framesConOverlay,
+  description: 'Terra_Gro_Selva_a_Potrero_Overlay_' + startYear + '_' + endYear,
+  fileNamePrefix: 'terra_guerrero_timelapse_overlay',
+  region: guerrero,          // puedes cambiar por un rectángulo si deseas un recorte
+  framesPerSecond: 2,        // ajusta según tu gusto (2–6 va bien)
+  scale: 250,                // 250–500 m recomendado
+  maxPixels: 1e13
+});
+
+/* PASOS:
+   - Da Run.
+   - Ve a la pestaña "Tasks" (arriba a la derecha).
+   - Pulsa "Run" en la tarea de video, revisa parámetros y confirma.
+   - Al terminar, el MP4 queda en tu Google Drive (carpeta raíz o "earthengine").
+*/
+
+
+/* ==============================
+   7) ASTER – “lupas” antes/después (lado cliente)
+============================== */
+var aster = ee.ImageCollection('ASTER/AST_L1T_003');
+
+top.evaluate(function (fc) {
+  var visAster = {bands: ['B3N','B02','B01'], min: 0, max: 255};
+
+  fc.features.forEach(function (feat) {
+    var name = feat.properties.ADM2_NAME;
+    // Geometría: centroid + buffer 3 km
+    var geom = ee.Geometry(feat.geometry).centroid().buffer(3000);
+
+    var early = ee.Image(
+      aster.filterBounds(geom)
+           .filterDate('2001-01-01', '2006-01-01')
+           .sort('CLOUDCOVER').first()
+    );
+    var late = ee.Image(
+      aster.filterBounds(geom)
+           .filterDate('2020-01-01', '2025-01-01')
+           .sort('CLOUDCOVER').first()
+    );
+
+    Map.addLayer(early.clip(geom), visAster, 'ASTER early - ' + name, false);
+    Map.addLayer(late.clip(geom),  visAster, 'ASTER late  - ' + name, false);
+  });
+});
+
+/* ==============================
+   8) Capas útiles (preview)
+============================== */
+Map.addLayer(
+  ndviDiff.clip(guerrero),
+  {min:-0.3, max:0.3, palette:['7f0000','ffffff','00441b']},
+  'NDVI (2020-24 vs 2001-05)',
+  false
+);
+/**** === EXPORTAR VIDEO SIN HUD + CSV DE CONTADORES (GEE) === ****/
+
+/* Usa lo que ya tenías:
+   - recodedCol  : ImageCollection de clases (0=otros,1=bosque,2=ag/pasto)
+   - pairwiseLoss: ImageCollection de pérdidas año→año con banda 'loss'
+   - guerrero, municipios, atoyacGeom (geom del municipio)
+   - visClass    : visualización para recodedCol
+   - startYear, endYear, fps, exportScale
+*/
+
+// 1) Overlay estático (límites + top, si tienes 'top'; si no, deja solo límites)
+var limitesMunImg = ee.Image().byte().paint(municipios, 1, 1)
+  .visualize({palette: ['ffffff'], opacity: 0.8});
+var overlayImg = limitesMunImg; // si quieres, blendea también el contorno de 'top'
+
+// 2) Frames del video (sin HUD)
+var framesVideo = recodedCol.map(function(img){
+  var year = ee.Number(img.get('year'));
+  var base = img.visualize({min:0, max:2, palette:['9e9e9e','1a9850','d7301f']});
+  var blended = base.blend(overlayImg);
+  return blended.set('system:time_start', ee.Date.fromYMD(year,1,1).millis());
+});
+
+// 3) Exporta el MP4 limpio
+Export.video.toDrive({
+  collection: framesVideo,
+  description: 'Terra_Gro_SelvaAPotrero_SIN_HUD_' + startYear + '_' + endYear,
+  fileNamePrefix: 'terra_guerrero_timelapse_sin_hud',
+  region: guerrero,
+  framesPerSecond: fps,   // p.ej. 2
+  scale: exportScale,     // p.ej. 250
+  maxPixels: 1e13
+});
+
+// ====== CSV con contadores por año (Guerrero + Atoyac) ======
+// === Geometría de Atoyac (robusta, con fallback) ===
+var atoyacCandidates = municipios.filter(
+  ee.Filter.or(
+    ee.Filter.stringContains('ADM2_NAME', 'Atoyac'),
+    ee.Filter.eq('ADM2_NAME', 'Atoyac de Alvarez'),
+    ee.Filter.eq('ADM2_NAME', 'Atoyac de Álvarez')
+  )
+);
+
+// Si encuentra Atoyac, usa su geometría; si no, usa un buffer pequeño del centro de Guerrero (para no romper exportación)
+var atoyacGeom = ee.Geometry(ee.Algorithms.If(
+  atoyacCandidates.size().gt(0),
+  ee.Feature(atoyacCandidates.first()).geometry(),
+  guerrero.centroid().buffer(1000)   // fallback
+));
+
+// Parche seguro: máscara acumulada que SIEMPRE tiene 1 banda 'loss'
+function getCumLossMask(year) {
+  year = ee.Number(year);
+  var filtered = pairwiseLoss.filter(ee.Filter.lte('year2', year));
+  var lossImg = ee.Image(ee.Algorithms.If(
+    filtered.size().gt(0),
+    filtered.max(),                 // banda 'loss'
+    ee.Image(0).rename('loss')      // banda 'loss' (todo 0)
+  ));
+  return lossImg.selfMask();
+}
+
+var ha = ee.Image.pixelArea().divide(10000).rename('ha');
+var yearsList = ee.List.sequence(startYear, endYear);
+
+// Serie por año: hectáreas acumuladas de pérdida
+var series = ee.FeatureCollection(yearsList.map(function(y){
+  var mask = getCumLossMask(y);
+
+  var gro = ee.Number(
+    ha.updateMask(mask).reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: guerrero,
+      scale: 500,
+      maxPixels: 1e13
+    }).get('ha')
+  );
+  var ato = ee.Number(
+    ha.updateMask(mask).reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: ee.Geometry(atoyacGeom),
+      scale: 500,
+      maxPixels: 1e13
+    }).get('ha')
+  );
+
+  gro = ee.Number(ee.Algorithms.If(gro, gro, 0));
+  ato = ee.Number(ee.Algorithms.If(ato, ato, 0));
+
+  return ee.Feature(null, {
+    year: y,
+    guerrero_ha: gro,
+    atoyac_ha: ato
+  });
+}));
+
+// Exporta CSV a Drive
+Export.table.toDrive({
+  collection: series,
+  description: 'Terra_Gro_series_perdida_ha_' + startYear + '_' + endYear,
+  fileFormat: 'CSV'
+});
