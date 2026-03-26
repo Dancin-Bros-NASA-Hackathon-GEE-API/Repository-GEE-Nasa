@@ -62,7 +62,7 @@ Todo el análisis geoespacial se realizó **100% con Google Earth Engine**.
 1. Clona el repositorio privado:
 
    ```cmd
-   git clone <repo-privado>
+   git clone https://github.com/Dancin-Bros-NASA-Hackathon-GEE-API/Repository-GEE-Nasa.git
    cd Repository-GEE-NASA
    ```
 2. Abre el proyecto en VSCode.
